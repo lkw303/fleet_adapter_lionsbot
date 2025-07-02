@@ -454,6 +454,52 @@ class RobotAPI:
 
         return None
 
+    def get_clean_progress(self, robot_name: str, process: str) -> float:
+        ''' Returns the clean progress in percentage.
+        '''
+        mission_status = self.get_mission_status(robot_name=robot_name)
+        if mission_status is None:
+            return 0.0
+        # zone is null when the robot is estopped during a clean task so this would return 0.0
+        if 'zone' in mission_status['missionStatus']['mission']:
+            if mission_status['missionStatus']['mission']['zone'] is not None:
+                if mission_status['missionStatus']['mission']['zone'].get('name') == process:
+                    return mission_status['missionStatus']['mission']['zone'].get('progress', 0.0)
+        return 0.0
+
+    def current_worksite_id(self, robot_name: str) -> str | None:
+        '''
+        return current worksite id
+        '''
+        map_data = self.get_robot_maps(robot_name=robot_name)
+        if map_data is not None:
+            return map_data.get('currentWorksiteMapId')
+        return None
+
+    def get_clean_path_from_zone(self, robot_name: str, zone_name: str):
+            '''
+            Get a path from the from the cleaning zone of the current worksite.
+            '''
+            current_worksite_id = self.current_worksite_id(robot_name=robot_name)
+            zones = self.get_zones_by_map(current_worksite_id)
+            if zones is None:
+                return None
+            for zone in zones:
+                if zone.get('name') == zone_name:
+                    print(f"Length {len(zone.get('paths'))}")
+                    print(f"Type {type(zone.get('paths'))}")
+                    print(f"Got paths [{zone.get('paths')}]")
+                    ls_paths = [int(coord) for coord in zone.get('paths').split(' ')]
+                    return ls_paths
+
+    def is_cleaning(self, robot_name: str) -> bool:
+        mission_status = self.get_mission_status(robot_name=robot_name)
+        if mission_status is None:
+            return False
+        if mission_status['missionStatus']['activeMissionType'] == 'WORKING':
+            return True
+        return False
+
     # ------------------------------------------------------------------------------
     # Robot Operations
     # ------------------------------------------------------------------------------

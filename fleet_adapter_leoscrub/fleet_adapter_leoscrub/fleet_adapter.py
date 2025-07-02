@@ -191,15 +191,27 @@ def initialize_fleet(config_yaml, nav_graph_path, node, use_sim_time, server_uri
         else:
             return False
 
+    # Whether to accept Custom RMF Action Task
+    def _consider(description: dict):
+        confirm = adpt.fleet_update_handle.Confirmation()
+        node.get_logger().warn(
+            f"Accepting action: {description} ")
+        confirm.accept()
+        return confirm
+
+    # Add clean task
+    fleet_handle.add_performable_action('clean', _consider)
+
     fleet_handle.accept_task_requests(
         partial(_task_request_check, task_capabilities))
 
     # Transforms
     transforms = initialize_map_transform(config_yaml['map_transform'])
-    
+
     def _updater_inserter(cmd_handle, update_handle):
         """Insert a RobotUpdateHandle."""
         cmd_handle.update_handle = update_handle
+        cmd_handle.participant = update_handle.get_unstable_participant()
 
     # Initialize robot API for this fleet
     api = RobotAPI(

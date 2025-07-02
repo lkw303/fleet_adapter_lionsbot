@@ -16,6 +16,7 @@ from rclpy.duration import Duration
 
 import rmf_adapter as adpt
 import rmf_adapter.plan as plan
+import rmf_adapter.schedule as schedule
 
 from .enums.enums import Topic
 from .models.DockProcessContent import DockProcessContent
@@ -44,7 +45,7 @@ from rmf_litter_msgs.msg import Location
 from .utils.MapTransform import MapTransform
 from .utils.Coordinate import RmfCoord
 from .utils.Coordinate import LionsbotCoord
-from typing import Dict, List
+from typing import Dict, List, Tuple
 from .RobotClientAPI import RobotAPI
 
 
@@ -133,6 +134,15 @@ class RobotCommandHandle(adpt.RobotCommandHandle):
         self._quit_path_event = threading.Event()
         self._dock_thread = None
         self._quit_dock_event = threading.Event()
+
+        # Perform Action variables
+        self.action_execution = None
+        self.stubborness = None
+        self.action_category = None
+        self.latest_clean_percentage = None
+        self.current_process = None
+        self.clean_percentage_threshold = 0 # Default value
+        self.interruption = None
 
         self.node.get_logger().info(
             f"The robot is starting at: {self.position}")
@@ -600,7 +610,7 @@ class RobotCommandHandle(adpt.RobotCommandHandle):
                         while self.api.robot_cleaning_paused(robot_name=self.name):
                             self.node.get_logger().info("Robot is paused while cleaning...")
                             self.sleep_for(0.6)
-                            
+
                         self.node.get_logger().info(f'Robot resumed cleaning: {self.name}')
                         with self._lock:
                             self.state = RobotState.MOVING
@@ -642,6 +652,8 @@ class RobotCommandHandle(adpt.RobotCommandHandle):
         self.node.get_logger().info(f'Current robot position: {self.position}')
         if self.update_handle is not None:
             self.update_state()
+        if (self.action_execution):
+            self.check_perform_action()
 
     def update_state(self):
         self.update_handle.update_battery_soc(self.battery_soc)
@@ -720,7 +732,164 @@ class RobotCommandHandle(adpt.RobotCommandHandle):
             if not before_lane and not after_lane:  # The robot is on this lane
                 return lane_index
         return None
-        
+
+    # ------------------------------------------------------------------------------
+    # Custom Tasks (Perform Action)
+    # ------------------------------------------------------------------------------
+    def _action_executor(self,
+                         category: str,
+                         description: dict,
+                         execution:
+                         adpt.robot_update_handle.ActionExecution):
+        with self._lock:
+            # Check task category
+            assert(category in ["clean"])
+
+            self.action_category = category
+            if (category == "clean"):
+                # TODO(KW): Use JSON schema
+                # Validation instead
+                if not description["clean_task_name"]:
+                    return False
+                # TODO(KW): Implement a certain number of retries
+                if self.api.start_process(
+                    robot_name=self.name,
+                    process=description["clean_task_name"],
+                    map_name=self.map_name):
+                    # might take a while before mission status changes so
+                    # we wait for a while just to be safe
+                    time.sleep(0.5)
+                    self.latest_clean_percentage = 0
+                    self.check_task_completion =\
+                        lambda : self.api.process_completed()
+                    self.state = RobotState.MOVING
+                    self.current_process = description['clean_task_name']
+                    self.set_cleaning_trajectory(self.current_process)
+
+                # If starting clean was not successful return
+                else:
+                    self.node.get_logger().error(
+                        f"Failed to initiate cleaning action for robot [{self.name}]")
+                    execution.error(f"Failed to initiate cleaning action for robot {self.name}")
+                    execution.finished()
+                    return
+
+            # Start Perform Action
+            self.node.get_logger().warn(f"Robot [{self.name}] starts [{category}] action")
+            self.start_action_time = self.adapter.now()
+            self.on_waypoint = None
+            self.on_lane = None
+            self.action_execution = execution
+            self.stubborness = self.update_handle.unstable_be_stubborn()
+            self.node.get_logger().warn(f"Robot [{self.name}] starts [{category}] action")
+            # TODO(KW): Determine an appropriate value to set the nominal
+            # velocity during cleaning task.
+            # self.vehicle_traits.linear.nominal_velocity = xxx
+
+    def handle_clean_failed(self):
+        print(f"Only cleaned up to {self.latest_clean_percentage}!")
+        self.latest_clean_percentage = 0
+        process = self.current_process
+        if self.api.start_process(process):
+            print(f"RE-DOING CLEAN TASK {process}")
+            self.set_cleaning_trajectory(process)
+            return
+        print("FAILED TO REDO CLEAN TASK! RETRYING")
+
+    def check_perform_action(self):
+        self.node.get_logger().info(f"Executing perform action [{self.action_category}]")
+        action_ok = self.action_execution.okay()
+        if self.check_task_completion() or not action_ok:
+            if action_ok:
+                if self.action_category == 'clean':
+                    if self.latest_clean_percentage  < self.clean_percentage_threshold:
+                        self.handle_clean_failed()
+                        return
+                self.node.get_logger().info(
+                    f"action [{self.action_category}] is completed")
+                starts = self.get_start_sets()
+                if starts is not None:
+                    self.update_handle.update_position(starts)
+                self.action_execution.finished()
+
+            else:
+                self.node.get_logger().warn(
+                    f"action [{self.action_category}] is killed/canceled")
+            self.stubborness.release()
+            self.stubborness = None
+            self.action_execution = None
+            self.start_action_time = None
+            self.latest_clean_percentage = None
+            self.check_task_completion = None
+            self.current_process = None
+            self.current_clean_path = None
+            return
+        assert(self.participant)
+        assert(self.start_action_time)
+
+        if self.action_category == "clean":
+            # Check mission status and update clean percentage.
+            if self.api.is_cleaning(robot_name=self.name):
+
+                # TODO (KW): Perhaps we can start setting the clean trajectory the first time
+                # this evluates to True so that it can better match the robot's position.
+                print(f"[{self.name}] Starting to clean!")
+
+                # NOTE: The schema for mission status from websockets is different compared
+                # to the one that you get from the restful APIs.
+                progress = self.api.get_clean_progress(robot_name=self.name, process=self.current_process)
+                # To prevent the percentage getting stuck at 100 when
+                # progress attribute not yet updated.
+                if self.latest_clean_percentage < progress:
+                    self.latest_clean_percentage = progress
+                    self.node.get_logger().info(\
+                        f"Update cleaning progress to {self.latest_clean_percentage}")
+
+                # Get remaining clean path and set the trajectory
+                remaining_clean_path = self.get_remaining_clean_path(
+                    self.latest_clean_percentage, self.current_clean_percentages, self.current_clean_path)
+
+                trajectory = schedule.make_trajectory(
+                    self.vehicle_traits,
+                    self.adapter.now(),
+                    remaining_clean_path)
+                route = schedule.Route(self.map_name, trajectory)
+                self.participant.set_itinerary([route])
+
+        # TODO(KW): Use a more accurate estimate
+        total_action_time = timedelta(hours=1.0)
+        remaining_time = total_action_time - (self.adapter.now() - self.start_action_time)
+        print(f"Still performing action, Estimated remaining time: [{remaining_time}]")
+        self.action_execution.update_remaining_time(remaining_time)
+
+    def set_cleaning_trajectory(self, process):
+        robot_positions = self.api.get_clean_path_from_zone(
+            robot_name=self.name,zone_name=process)
+        assert(len(robot_positions) % 2 == 0)
+        rmf_positions = []
+        for i in range(0, len(robot_positions), 2):
+            robot_pose = [robot_positions[i], robot_positions[i+1], 0]
+            rmf_pose = self.transforms[self.current_level]['tf'].to_rmf_map(
+                [robot_pose[0], -robot_pose[1], robot_pose[2]])
+            rmf_positions.append(rmf_pose)
+
+        self.current_clean_path = rmf_positions
+        current_total_clean_distance = sum([self.dist(rmf_positions[i], rmf_positions[i+1]) for i in range(0, (len(rmf_positions) - 1), 2)])
+        initial_percentage = 0
+
+        self.current_clean_percentages = []
+        initial_percentage = 0.0
+        for i in range(0, (len(rmf_positions) -1)):
+            initial_percentage += (self.dist(rmf_positions[i], rmf_positions[i+1])/current_total_clean_distance)*100
+            self.current_clean_percentages.append(initial_percentage)
+
+        trajectory = schedule.make_trajectory(
+            self.vehicle_traits,
+            self.adapter.now(),
+            rmf_positions)
+        route = schedule.Route(self.map_name, trajectory)
+        self.participant.set_itinerary([route])
+
     # ------------------------------------------------------------------------------
     # Helper functions
     # ------------------------------------------------------------------------------
@@ -735,7 +904,23 @@ class RobotCommandHandle(adpt.RobotCommandHandle):
         for i in range(len(waypoints)):
             remaining_waypoints.append(PlanWaypoint(i, waypoints[i]))
         return remaining_waypoints
-    
+
+    def get_clean_path_index(self, percentage: float, clean_path_percentages: List[float]) -> int:
+        if percentage <= 0.0:
+            return 0
+        if percentage <= clean_path_percentages[0]:
+            return 1
+        for i in range(0, len(clean_path_percentages) - 1):
+            if percentage > clean_path_percentages[i] and percentage <= clean_path_percentages[i+1]:
+                return i + 2
+
+    def get_remaining_clean_path(self, percentage: float, clean_path_percentages: List[float], clean_path: List[Tuple[int, int, int]]) -> List[Tuple[int, int, int]]:
+        if percentage is None:
+            percentage = 0.0
+        clean_path_index = self.get_clean_path_index(percentage, clean_path_percentages)
+        # Robot has not start clean path
+        return [self.position, *clean_path[clean_path_index:]]
+
     # ------------------------------------------------------------------------------
     # Static Variables
     # ------------------------------------------------------------------------------
